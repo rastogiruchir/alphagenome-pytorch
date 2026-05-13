@@ -1,7 +1,6 @@
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from . import layers
 
 _MAX_RELATIVE_DISTANCE = 8192
@@ -155,6 +154,8 @@ class MHABlock(nn.Module):
         self.norm_v = layers.LayerNorm(192)
         self.final_norm = layers.RMSBatchNorm(d_model, channels_last=True)
         self.linear_embedding = nn.Linear(8 * 192, d_model)
+        self.logits_soft_cap = layers.TanhSoftCap(5.0)
+        self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, attention_bias, compute_dtype=None):
         B, S, D = x.shape
@@ -170,8 +171,8 @@ class MHABlock(nn.Module):
         k = self.norm_k(self.k_proj(h).view(B, S, 1, 128))
         v = self.norm_v(self.v_proj(h).view(B, S, 1, 192))
 
-        q = apply_rope(q, inplace=True)
-        k = apply_rope(k, inplace=True)
+        q = apply_rope(q, inplace=False)
+        k = apply_rope(k, inplace=False)
 
         q_t = q.permute(0, 2, 1, 3)  # (B, 8, S, C)
         k_t = k.permute(0, 2, 1, 3)  # (B, 1, S, C)
@@ -184,10 +185,9 @@ class MHABlock(nn.Module):
         if attention_bias is not None:
             att = att + attention_bias.float()
 
-        logits_soft_cap = 5.0
-        att = torch.tanh(att / logits_soft_cap) * logits_soft_cap
+        att = self.logits_soft_cap(att)
 
-        attn_weights = F.softmax(att, dim=-1)
+        attn_weights = self.softmax(att)
 
         # Value projection: bf16 matmul then cast back to compute dtype
         v_t = v.permute(0, 2, 1, 3)
@@ -205,10 +205,11 @@ class MLPBlock(nn.Module):
         self.fc1 = nn.Linear(d_model, d_model * 2)
         self.fc2 = nn.Linear(d_model * 2, d_model)
         self.final_norm = layers.RMSBatchNorm(d_model, channels_last=True)
+        self.activation = nn.ReLU()
 
     def forward(self, x):
         h = self.norm(x)
-        h = F.relu(self.fc1(h))
+        h = self.activation(self.fc1(h))
         h = self.fc2(h)
         return self.final_norm(h)
 
@@ -217,10 +218,11 @@ class AttentionBiasBlock(nn.Module):
         super().__init__()
         self.norm = layers.RMSBatchNorm(pair_dim, channels_last=True)
         self.proj = nn.Linear(pair_dim, 8, bias=False)
+        self.activation = nn.GELU()
 
     def forward(self, x):
         # x: (B, s, s, D)
-        h = F.gelu(self.norm(x))
+        h = self.activation(self.norm(x))
         h = self.proj(h) # (B, s, s, 8)
         # Repeat 16x16
         h = torch.repeat_interleave(h, 16, dim=1)
@@ -253,6 +255,7 @@ class SequenceToPairBlock(nn.Module):
         self.linear_y_k = nn.Linear(d_model, self.head_dim, bias=False)
         
         self.linear_pair = nn.Linear(self.num_heads, self.head_dim) 
+        self.activation = nn.GELU()
 
     def forward(self, x):
         # x: (B, S, D) - NLC format
@@ -287,7 +290,7 @@ class SequenceToPairBlock(nn.Module):
         a = a + 0.5 * (rel_q_a + rel_k_a)
         
         # y branches
-        x_gelu = F.gelu(x_norm)
+        x_gelu = self.activation(x_norm)
         y_q = self.linear_y_q(x_gelu)
         y_k = self.linear_y_k(x_gelu)
         
@@ -307,6 +310,7 @@ class RowAttentionBlock(nn.Module):
         self.linear_q = nn.Linear(pair_dim, pair_dim, bias=False)
         self.linear_k = nn.Linear(pair_dim, pair_dim, bias=False)
         self.linear_v = nn.Linear(pair_dim, pair_dim)
+        self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, compute_dtype=None):
         if compute_dtype is None:
@@ -321,7 +325,7 @@ class RowAttentionBlock(nn.Module):
         # Attention: bf16 einsum then cast to f32 (matches JAX BF16_BF16_F32)
         scale = 1.0 / math.sqrt(128.0)
         attn = torch.einsum('bpqf,bpkf->bpqk', q, k).float() * scale
-        attn = F.softmax(attn, dim=-1)
+        attn = self.softmax(attn)
 
         # Value projection: bf16 einsum then cast back
         out = torch.einsum('bpqk,bpkf->bpqf', attn.to(compute_dtype), v).float()
@@ -333,11 +337,12 @@ class PairMLPBlock(nn.Module):
         self.norm = layers.LayerNorm(pair_dim, rms_norm=True)
         self.linear1 = nn.Linear(pair_dim, 2 * pair_dim)
         self.linear2 = nn.Linear(2 * pair_dim, pair_dim)
+        self.activation = nn.ReLU()
         
     def forward(self, x):
         h = self.norm(x)
         h = self.linear1(h)
-        h = F.relu(h)
+        h = self.activation(h)
         h = self.linear2(h)
         return h
 

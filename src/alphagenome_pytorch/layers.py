@@ -2,6 +2,52 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+class JaxGELU(nn.Module):
+    """GELU approximation used by the JAX AlphaGenome implementation."""
+
+    def __init__(self, coefficient: float = 1.702):
+        super().__init__()
+        self.coefficient = coefficient
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        coef = x.new_tensor(self.coefficient)
+        return torch.sigmoid(coef * x) * x
+
+
+class TanhSoftCap(nn.Module):
+    """Soft-cap logits with tanh while preserving a hookable module boundary."""
+
+    def __init__(self, soft_cap: float):
+        super().__init__()
+        self.soft_cap = soft_cap
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(x / self.soft_cap) * self.soft_cap
+
+
+class Log1p(nn.Module):
+    """Hookable torch.log1p wrapper."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.log1p(x)
+
+
+class SoftClip(nn.Module):
+    """Hookable soft clipping used when unscaling genomic track predictions."""
+
+    def __init__(self, soft_clip_value: float):
+        super().__init__()
+        self.soft_clip_value = soft_clip_value
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.where(
+            x > self.soft_clip_value,
+            (x + self.soft_clip_value) ** 2 / (4 * self.soft_clip_value),
+            x,
+        )
+
+
 def gelu(x):
     """GELU using JAX's custom approximation: sigmoid(1.702 * x) * x
 
@@ -22,6 +68,12 @@ class Pool1d(nn.Module):
         self.kernel_size = kernel_size
         self.stride = stride if stride is not None else kernel_size
         self.method = method
+        if self.method == 'max':
+            self.pool = nn.MaxPool1d(kernel_size=self.kernel_size, stride=self.stride)
+        elif self.method in ['avg', 'mean']:
+            self.pool = nn.AvgPool1d(kernel_size=self.kernel_size, stride=self.stride)
+        else:
+            self.pool = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, S) - NCL format, no transpose needed
@@ -34,12 +86,9 @@ class Pool1d(nn.Module):
         if pad_total > 0:
             x = F.pad(x, (pad_left, pad_right))
 
-        if self.method == 'max':
-            return F.max_pool1d(x, kernel_size=self.kernel_size, stride=self.stride)
-        elif self.method in ['avg', 'mean']:
-            return F.avg_pool1d(x, kernel_size=self.kernel_size, stride=self.stride)
-        else:
+        if self.pool is None:
             raise NotImplementedError(f"Pooling method {self.method} not implemented")
+        return self.pool(x)
 
 class RMSBatchNorm(nn.Module):
     """RMS Batch Normalization supporting both channels-first and channels-last formats.

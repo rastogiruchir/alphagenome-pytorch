@@ -2,9 +2,9 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
 from alphagenome_pytorch.attention import apply_rope
+from alphagenome_pytorch import layers
 
 _SOFT_CLIP_VALUE = 10.0
 TRUNK_DIM = 1536
@@ -23,6 +23,7 @@ def predictions_scaling(
     apply_squashing: bool,
     soft_clip_value: float = _SOFT_CLIP_VALUE,
     channels_last: bool = True,
+    soft_clip_module: nn.Module | None = None,
 ) -> torch.Tensor:
     """Scales predictions to experimental data scale.
 
@@ -40,11 +41,14 @@ def predictions_scaling(
         Scaled predictions in experimental data space (same format as input)
     """
     # Soft clip: where x > soft_clip_value, apply quadratic expansion
-    x = torch.where(
-        x > soft_clip_value,
-        (x + soft_clip_value) ** 2 / (4 * soft_clip_value),
-        x,
-    )
+    if soft_clip_module is None:
+        x = torch.where(
+            x > soft_clip_value,
+            (x + soft_clip_value) ** 2 / (4 * soft_clip_value),
+            x,
+        )
+    else:
+        x = soft_clip_module(x)
 
     # Apply squashing inverse (power law expansion) for RNA-seq type heads
     if apply_squashing:
@@ -267,12 +271,20 @@ class GenomeTracksHead(nn.Module):
 
         self.convs = nn.ModuleDict()
         self.residual_scales = nn.ParameterDict()
+        # Per-resolution instances so tangermeme DeepLIFT hooks (which cache
+        # module.input/output on every forward) don't alias state across the
+        # two calls this head makes per forward pass.
+        self.prediction_softplus = nn.ModuleDict()
+        self.prediction_soft_clip = nn.ModuleDict()
+        self.scale_softplus = nn.Softplus()
 
         for res in self.resolutions:
             res_str = str(res)
             dim = resolved_in_channels[res]
 
             self.convs[res_str] = MultiOrganismConv1d(dim, num_tracks, num_organisms, init_scheme=init_scheme)
+            self.prediction_softplus[res_str] = nn.Softplus()
+            self.prediction_soft_clip[res_str] = layers.SoftClip(_SOFT_CLIP_VALUE)
 
             # learnt_scale: (num_organisms, num_tracks)
             self.residual_scales[res_str] = nn.Parameter(torch.ones(num_organisms, num_tracks))
@@ -286,19 +298,20 @@ class GenomeTracksHead(nn.Module):
         scale = self.residual_scales[res_str][organism_index]
 
         # Softplus: softplus(x) * softplus(scale)
-        x = F.softplus(x) * F.softplus(scale.unsqueeze(2))
+        x = self.prediction_softplus[res_str](x) * self.scale_softplus(scale.unsqueeze(2))
 
         return x
 
-    def unscale(self, x, organism_index, resolution, channels_last=True):
+    def unscale(self, x, organism_index, res_str, channels_last=True):
         """Unscales predictions to experimental data scale."""
         track_means = self.track_means[organism_index]  # (B, num_tracks)
         return predictions_scaling(
             x,
             track_means=track_means,
-            resolution=resolution,
+            resolution=int(res_str),
             apply_squashing=self.apply_squashing,
             channels_last=channels_last,
+            soft_clip_module=self.prediction_soft_clip[res_str],
         )
 
     def scale(self, x, organism_index, resolution, channels_last=True):
@@ -355,7 +368,7 @@ class GenomeTracksHead(nn.Module):
             if return_scaled:
                 outputs[res] = scaled_pred
             else:
-                outputs[res] = self.unscale(scaled_pred, organism_index, res, channels_last)
+                outputs[res] = self.unscale(scaled_pred, organism_index, res_str, channels_last)
 
         return outputs
 
@@ -413,6 +426,8 @@ class SpliceSitesClassificationHead(nn.Module):
             out_channels=5,  # 5 classes
             num_organisms=num_organisms
         )
+        self.softmax_channels_last = nn.Softmax(dim=-1)
+        self.softmax_channels_first = nn.Softmax(dim=1)
 
     def forward(self, embeddings_1bp, organism_index, channels_last=True):
         # embeddings_1bp: (B, C, S) - NCL format (internal)
@@ -422,11 +437,11 @@ class SpliceSitesClassificationHead(nn.Module):
             # Transpose to NLC: (B, 5, S) -> (B, S, 5)
             logits = logits_ncl.transpose(1, 2)
             # Softmax over classes (dim=-1 in NLC)
-            probs = F.softmax(logits, dim=-1)
+            probs = self.softmax_channels_last(logits)
         else:
             logits = logits_ncl
             # Softmax over classes (dim=1 in NCL)
-            probs = F.softmax(logits, dim=1)
+            probs = self.softmax_channels_first(logits)
 
         return {
             "logits": logits,
@@ -483,6 +498,7 @@ class SpliceSitesUsageHead(nn.Module):
             out_channels=num_output_tracks,  # NUM_SPLICE_TISSUES * 2 strands
             num_organisms=num_organisms
         )
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, embeddings_1bp, organism_index, channels_last=True):
         # embeddings_1bp: (B, C, S) - NCL format (internal)
@@ -496,7 +512,7 @@ class SpliceSitesUsageHead(nn.Module):
             logits = logits_ncl
             mask = self.track_mask[organism_index][:, :, None]
 
-        predictions = torch.sigmoid(logits)
+        predictions = self.sigmoid(logits)
 
         return {
             "logits": logits,
@@ -564,6 +580,8 @@ class SpliceSitesJunctionHead(nn.Module):
             "neg_donor": make_rope_params(),
             "neg_acceptor": make_rope_params(),
         })
+        self.pos_counts_softplus = nn.Softplus()
+        self.neg_counts_softplus = nn.Softplus()
 
     def forward(self, embeddings_1bp, organism_index, channels_last=True, **kwargs):
         """
@@ -607,7 +625,7 @@ class SpliceSitesJunctionHead(nn.Module):
                 return apply_rope(
                     x, indices,
                     max_position=self._max_position_encoding_distance,
-                    inplace=True,
+                    inplace=False,
                 )
 
             pos_donor_logits = _apply_rope(
@@ -627,10 +645,10 @@ class SpliceSitesJunctionHead(nn.Module):
                 self.rope_params["neg_acceptor"], organism_index
             )
 
-            pos_counts = F.softplus(torch.einsum(
+            pos_counts = self.pos_counts_softplus(torch.einsum(
                 "bdth,bath->bdat", pos_donor_logits, pos_acceptor_logits
             ))
-            neg_counts = F.softplus(torch.einsum(
+            neg_counts = self.neg_counts_softplus(torch.einsum(
                 "bdth,bath->bdat", neg_donor_logits, neg_acceptor_logits
             ))
 
