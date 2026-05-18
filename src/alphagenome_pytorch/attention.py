@@ -154,6 +154,8 @@ class MHABlock(nn.Module):
         self.norm_v = layers.LayerNorm(192)
         self.final_norm = layers.RMSBatchNorm(d_model, channels_last=True)
         self.linear_embedding = nn.Linear(8 * 192, d_model)
+        self.qk_bilinear = layers.BilinearOp()
+        self.attn_value_bilinear = layers.BilinearOp()
         self.logits_soft_cap = layers.TanhSoftCap(5.0)
         self.softmax = nn.Softmax(dim=-1)
 
@@ -179,7 +181,7 @@ class MHABlock(nn.Module):
 
         # Attention logits: bf16 matmul then cast to f32 (matches JAX BF16_BF16_F32)
         # JAX uses precision=BF16_BF16_F32: bf16 inputs, f32 accumulation, f32 output
-        att = torch.matmul(q_t, k_t.transpose(-2, -1)).float()  # (B, 8, S, S)
+        att = self.qk_bilinear(q_t, k_t.transpose(-2, -1)).float()  # (B, 8, S, S)
         att = att / math.sqrt(128.0)
 
         if attention_bias is not None:
@@ -191,7 +193,7 @@ class MHABlock(nn.Module):
 
         # Value projection: bf16 matmul then cast back to compute dtype
         v_t = v.permute(0, 2, 1, 3)
-        y = torch.matmul(attn_weights.to(compute_dtype), v_t).float()  # (B, 8, S, 192)
+        y = self.attn_value_bilinear(attn_weights.to(compute_dtype), v_t).float()  # (B, 8, S, 192)
         y = y.to(compute_dtype)
         y = y.permute(0, 2, 1, 3).reshape(B, S, -1)
 
@@ -256,6 +258,7 @@ class SequenceToPairBlock(nn.Module):
         
         self.linear_pair = nn.Linear(self.num_heads, self.head_dim) 
         self.activation = nn.GELU()
+        self.seq_pair_bilinear = layers.BilinearOp("bqhc,bkhc->bqkh")
 
     def forward(self, x):
         # x: (B, S, D) - NLC format
@@ -286,7 +289,7 @@ class SequenceToPairBlock(nn.Module):
         rel_q_a = rel_q_a.permute(0, 2, 3, 1) # (B, S', S', H)
         rel_k_a = rel_k_a.permute(0, 3, 2, 1) # (B, S', S', H) from bhkp -> bpkh logic
         
-        a = torch.einsum('bqhc,bkhc->bqkh', q, k) # (B, S', S', H)
+        a = self.seq_pair_bilinear(q, k) # (B, S', S', H)
         a = a + 0.5 * (rel_q_a + rel_k_a)
         
         # y branches
@@ -310,6 +313,8 @@ class RowAttentionBlock(nn.Module):
         self.linear_q = nn.Linear(pair_dim, pair_dim, bias=False)
         self.linear_k = nn.Linear(pair_dim, pair_dim, bias=False)
         self.linear_v = nn.Linear(pair_dim, pair_dim)
+        self.qk_bilinear = layers.BilinearOp("bpqf,bpkf->bpqk")
+        self.attn_value_bilinear = layers.BilinearOp("bpqk,bpkf->bpqf")
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, compute_dtype=None):
@@ -324,11 +329,11 @@ class RowAttentionBlock(nn.Module):
 
         # Attention: bf16 einsum then cast to f32 (matches JAX BF16_BF16_F32)
         scale = 1.0 / math.sqrt(128.0)
-        attn = torch.einsum('bpqf,bpkf->bpqk', q, k).float() * scale
+        attn = self.qk_bilinear(q, k).float() * scale
         attn = self.softmax(attn)
 
         # Value projection: bf16 einsum then cast back
-        out = torch.einsum('bpqk,bpkf->bpqf', attn.to(compute_dtype), v).float()
+        out = self.attn_value_bilinear(attn.to(compute_dtype), v).float()
         return out.to(compute_dtype)
 
 class PairMLPBlock(nn.Module):

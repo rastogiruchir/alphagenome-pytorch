@@ -580,6 +580,8 @@ class SpliceSitesJunctionHead(nn.Module):
             "neg_donor": make_rope_params(),
             "neg_acceptor": make_rope_params(),
         })
+        self.pos_splice_pair_bilinear = layers.BilinearOp("bdth,bath->bdat")
+        self.neg_splice_pair_bilinear = layers.BilinearOp("bdth,bath->bdat")
         self.pos_counts_softplus = nn.Softplus()
         self.neg_counts_softplus = nn.Softplus()
 
@@ -645,12 +647,12 @@ class SpliceSitesJunctionHead(nn.Module):
                 self.rope_params["neg_acceptor"], organism_index
             )
 
-            pos_counts = self.pos_counts_softplus(torch.einsum(
-                "bdth,bath->bdat", pos_donor_logits, pos_acceptor_logits
-            ))
-            neg_counts = self.neg_counts_softplus(torch.einsum(
-                "bdth,bath->bdat", neg_donor_logits, neg_acceptor_logits
-            ))
+            pos_counts = self.pos_counts_softplus(
+                self.pos_splice_pair_bilinear(pos_donor_logits, pos_acceptor_logits)
+            )
+            neg_counts = self.neg_counts_softplus(
+                self.neg_splice_pair_bilinear(neg_donor_logits, neg_acceptor_logits)
+            )
 
             pos_mask = torch.einsum("bd,ba->bda", pos_donor_idx >= 0, pos_acceptor_idx >= 0)
             neg_mask = torch.einsum("bd,ba->bda", neg_donor_idx >= 0, neg_acceptor_idx >= 0)

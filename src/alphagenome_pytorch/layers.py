@@ -48,6 +48,31 @@ class SoftClip(nn.Module):
         )
 
 
+class BilinearOp(nn.Module):
+    """Hookable binary bilinear contraction.
+
+    If ``equation`` is None, this module computes ``torch.matmul(left, right)``.
+    Otherwise it computes ``torch.einsum(equation, left, right)``. The operands
+    are used exactly as passed; any transpose, reshape, cast, or scaling should
+    happen outside this module so attribution rules stay simple.
+    """
+
+    def __init__(self, equation: str | None = None):
+        super().__init__()
+        self.equation = equation
+
+    def forward(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        # Tangermeme temporarily adds _NON_LINEAR_OPS to every module while its
+        # DeepLIFT hooks are active; only cache these large tensors in that mode.
+        if hasattr(self, "_NON_LINEAR_OPS"):
+            self.left = left.detach()
+            self.right = right.detach()
+
+        if self.equation is None:
+            return torch.matmul(left, right)
+        return torch.einsum(self.equation, left, right)
+
+
 def gelu(x):
     """GELU using JAX's custom approximation: sigmoid(1.702 * x) * x
 
