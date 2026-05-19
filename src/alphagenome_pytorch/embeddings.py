@@ -30,7 +30,7 @@ class OutputEmbedder(nn.Module):
 
         self.organism_embed = nn.Embedding(num_organisms, out_channels)
         self.norm = layers.RMSBatchNorm(channels=out_channels)
-        self.activation = layers.JaxGELU()
+        self.activation = layers.QuickGELU()
 
     def forward(self, x, organism_index, skip_x=None, channels_last=False):
         # x: (B, C, S) - NCL format
@@ -76,7 +76,7 @@ class OutputPair(nn.Module):
         self.num_organisms = num_organisms
         self.organism_embed = nn.Embedding(num_organisms, dim)
         self.norm = layers.LayerNorm(normalized_shape=dim, rms_norm=True)
-        self.activation = layers.JaxGELU()
+        self.activation = layers.QuickGELU()
 
     def forward(self, x, organism_index):
         # x: (B, S, S, D) - pair activations

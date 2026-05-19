@@ -58,7 +58,7 @@ class ConvBlock(nn.Module):
         self.kernel_size = kernel_size
 
         self.norm = layers.RMSBatchNorm(in_channels)
-        self.activation = layers.JaxGELU()
+        self.activation = layers.QuickGELU()
 
         if kernel_size == 1:
             # Use Conv1d(k=1) instead of Linear - same math, native NCL

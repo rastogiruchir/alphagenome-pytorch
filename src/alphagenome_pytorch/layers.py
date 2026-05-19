@@ -2,22 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class JaxGELU(nn.Module):
-    """GELU approximation used by the JAX AlphaGenome implementation."""
-
-    def __init__(self, coefficient: float = 1.702):
-        super().__init__()
-        self.coefficient = coefficient
-
+class QuickGELU(nn.Module):
+    """GELU using sigmoid-gated approximation."""
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        coef = x.new_tensor(self.coefficient)
+        coef = torch.tensor(1.702, dtype=x.dtype, device=x.device)
         return torch.sigmoid(coef * x) * x
-
 
 class TanhSoftCap(nn.Module):
     """Soft-cap logits with tanh while preserving a hookable module boundary."""
-
     def __init__(self, soft_cap: float):
         super().__init__()
         self.soft_cap = soft_cap
@@ -25,17 +17,13 @@ class TanhSoftCap(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.tanh(x / self.soft_cap) * self.soft_cap
 
-
 class Log1p(nn.Module):
     """Hookable torch.log1p wrapper."""
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.log1p(x)
 
-
 class SoftClip(nn.Module):
     """Hookable soft clipping used when unscaling genomic track predictions."""
-
     def __init__(self, soft_clip_value: float):
         super().__init__()
         self.soft_clip_value = soft_clip_value
@@ -47,7 +35,6 @@ class SoftClip(nn.Module):
             x,
         )
 
-
 class BilinearOp(nn.Module):
     """Hookable binary bilinear contraction.
 
@@ -56,7 +43,6 @@ class BilinearOp(nn.Module):
     are used exactly as passed; any transpose, reshape, cast, or scaling should
     happen outside this module so attribution rules stay simple.
     """
-
     def __init__(self, equation: str | None = None):
         super().__init__()
         self.equation = equation
@@ -71,16 +57,6 @@ class BilinearOp(nn.Module):
         if self.equation is None:
             return torch.matmul(left, right)
         return torch.einsum(self.equation, left, right)
-
-
-def gelu(x):
-    """GELU using JAX's custom approximation: sigmoid(1.702 * x) * x
-
-    Matches JAX: alphagenome_research.model.layers.gelu
-    JAX explicitly converts coefficient to match input dtype.
-    """
-    coef = torch.tensor(1.702, dtype=x.dtype, device=x.device)
-    return torch.sigmoid(coef * x) * x
 
 class Pool1d(nn.Module):
     """1D pooling with SAME padding. Expects NCL input (B, C, S).

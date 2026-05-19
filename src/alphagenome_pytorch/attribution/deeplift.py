@@ -46,9 +46,9 @@ def local_dinucleotide_shuffle(
                 bins[-2] = (bins[-2][0], bins[-1][1])
                 bins.pop()
 
-            for k, (bin_start, bin_end) in enumerate(bins):
+            for (bin_start, bin_end) in bins:
                 shuffled = dinucleotide_shuffle(
-                    X[i : i + 1, :, bin_start:bin_end],
+                    X[i:i+1, :, bin_start:bin_end],
                     n=1,
                     random_state=rng.randint(0, 2**31 - 1),
                     verbose=verbose,
