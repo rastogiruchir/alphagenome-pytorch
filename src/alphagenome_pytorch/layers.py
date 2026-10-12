@@ -8,22 +8,13 @@ class QuickGELU(nn.Module):
         coef = torch.tensor(1.702, dtype=x.dtype, device=x.device)
         return torch.sigmoid(coef * x) * x
 
-class TanhSoftCap(nn.Module):
-    """Soft-cap logits with tanh while preserving a hookable module boundary."""
-    def __init__(self, soft_cap: float):
-        super().__init__()
-        self.soft_cap = soft_cap
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(x / self.soft_cap) * self.soft_cap
-
 class Log1p(nn.Module):
     """Hookable torch.log1p wrapper."""
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.log1p(x)
 
-class SoftClip(nn.Module):
-    """Hookable soft clipping used when unscaling genomic track predictions."""
+class UndoSoftClip(nn.Module):
+    """Hookable inverse of soft clipping used when unscaling genomic track predictions."""
     def __init__(self, soft_clip_value: float):
         super().__init__()
         self.soft_clip_value = soft_clip_value
@@ -34,6 +25,11 @@ class SoftClip(nn.Module):
             (x + self.soft_clip_value) ** 2 / (4 * self.soft_clip_value),
             x,
         )
+
+class UndoSquashing(nn.Module):
+    """Undo the power-law squashing used for RNA-seq targets."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.pow(x, 1.0 / 0.75)
 
 class BilinearOp(nn.Module):
     """Hookable binary bilinear contraction.

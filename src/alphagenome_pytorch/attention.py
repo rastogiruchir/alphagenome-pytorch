@@ -160,7 +160,7 @@ class MHABlock(nn.Module):
         self.linear_embedding = nn.Linear(8 * 192, d_model)
         self.qk_bilinear = layers.BilinearOp()
         self.av_bilinear = layers.BilinearOp()
-        self.logits_soft_cap = layers.TanhSoftCap(5.0)
+        self.soft_cap_tanh = nn.Tanh()
         # nn.Module allows registering forward hooks to extract attn weights
         # e.g.: mha.attn_softmax.register_forward_hook(...)
         self.attn_softmax = nn.Softmax(dim=-1)
@@ -179,6 +179,9 @@ class MHABlock(nn.Module):
         k = self.norm_k(self.k_proj(h).view(B, S, 1, 128))
         v = self.norm_v(self.v_proj(h).view(B, S, 1, 192))
 
+        # DeepLIFT's backward hooks wrap outputs of norm_q and norm_k in
+        # BackwardHookFunction. PyTorch forbids modifying these tensors in place.
+        # Therefore, call apply_rope with inplace=False.
         q = apply_rope(q, inplace=False)
         k = apply_rope(k, inplace=False)
 
@@ -193,7 +196,8 @@ class MHABlock(nn.Module):
         if attention_bias is not None:
             att = att + attention_bias.float()
 
-        att = self.logits_soft_cap(att)
+        logits_soft_cap = 5.0
+        att = self.soft_cap_tanh(att / logits_soft_cap) * logits_soft_cap
 
         attn_weights = self.attn_softmax(att)
 
@@ -264,7 +268,7 @@ class SequenceToPairBlock(nn.Module):
         
         self.linear_pair = nn.Linear(self.num_heads, self.head_dim) 
         self.activation = nn.GELU()
-        self.seq_pair_bilinear = layers.BilinearOp("bqhc,bkhc->bqkh")
+        self.pairwise_dot_product = layers.BilinearOp("bqhc,bkhc->bqkh")
 
     def forward(self, x):
         # x: (B, S, D) - NLC format
@@ -295,7 +299,7 @@ class SequenceToPairBlock(nn.Module):
         rel_q_a = rel_q_a.permute(0, 2, 3, 1) # (B, S', S', H)
         rel_k_a = rel_k_a.permute(0, 3, 2, 1) # (B, S', S', H) from bhkp -> bpkh logic
         
-        a = self.seq_pair_bilinear(q, k) # (B, S', S', H)
+        a = self.pairwise_dot_product(q, k) # (B, S', S', H)
         a = a + 0.5 * (rel_q_a + rel_k_a)
         
         # y branches

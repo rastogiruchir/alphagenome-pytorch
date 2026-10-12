@@ -80,9 +80,6 @@ class SequenceEncoder(nn.Module):
             self.down_blocks.append(convolutions.DownResBlock(in_channels))
             in_channels += 128
 
-        # One Pool1d instance per call site (post-embedder + one per down block)
-        # so tangermeme DeepLIFT hooks don't alias cached state across calls of
-        # different spatial extent.
         self.pools = nn.ModuleList(
             [layers.Pool1d(kernel_size=2) for _ in range(len(self.bin_sizes) + 1)]
         )

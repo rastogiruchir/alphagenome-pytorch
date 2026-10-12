@@ -23,7 +23,8 @@ def predictions_scaling(
     apply_squashing: bool,
     soft_clip_value: float = _SOFT_CLIP_VALUE,
     channels_last: bool = True,
-    soft_clip_module: nn.Module | None = None,
+    undo_softclip_module: nn.Module | None = None,
+    undo_squashing_module: nn.Module | None = None,
 ) -> torch.Tensor:
     """Scales predictions to experimental data scale.
 
@@ -36,23 +37,24 @@ def predictions_scaling(
         apply_squashing: Whether to apply power law expansion (for RNA-seq)
         soft_clip_value: Value for soft clipping
         channels_last: If True, x is NLC. If False, x is NCL.
+        undo_softclip_module: Module for undoing soft clipping. If None, creates
+            an UndoSoftClip module on the fly.
+        undo_squashing_module: Module for undoing squashing. If None, creates
+            an UndoSquashing module on the fly when apply_squashing is True.
 
     Returns:
         Scaled predictions in experimental data space (same format as input)
     """
-    # Soft clip: where x > soft_clip_value, apply quadratic expansion
-    if soft_clip_module is None:
-        x = torch.where(
-            x > soft_clip_value,
-            (x + soft_clip_value) ** 2 / (4 * soft_clip_value),
-            x,
-        )
-    else:
-        x = soft_clip_module(x)
+    # Undo soft clip: where x > soft_clip_value, apply quadratic expansion
+    if undo_softclip_module is None:
+        undo_softclip_module = layers.UndoSoftClip(soft_clip_value)
+    x = undo_softclip_module(x)
 
     # Apply squashing inverse (power law expansion) for RNA-seq type heads
     if apply_squashing:
-        x = torch.pow(x, 1.0 / 0.75)
+        if undo_squashing_module is None:
+            undo_squashing_module = layers.UndoSquashing()
+        x = undo_squashing_module(x)
 
     # Scale by track means and resolution
     if channels_last:
@@ -275,8 +277,9 @@ class GenomeTracksHead(nn.Module):
         # module.input/output on every forward) don't alias state across the
         # two calls this head makes per forward pass.
         self.prediction_softplus = nn.ModuleDict()
-        self.prediction_soft_clip = nn.ModuleDict()
-        self.scale_softplus = nn.Softplus()
+        self.scale_softplus = nn.ModuleDict()
+        self.undo_softclip = nn.ModuleDict()
+        self.undo_squashing = nn.ModuleDict()
 
         for res in self.resolutions:
             res_str = str(res)
@@ -284,7 +287,9 @@ class GenomeTracksHead(nn.Module):
 
             self.convs[res_str] = MultiOrganismConv1d(dim, num_tracks, num_organisms, init_scheme=init_scheme)
             self.prediction_softplus[res_str] = nn.Softplus()
-            self.prediction_soft_clip[res_str] = layers.SoftClip(_SOFT_CLIP_VALUE)
+            self.scale_softplus[res_str] = nn.Softplus()
+            self.undo_softclip[res_str] = layers.UndoSoftClip(_SOFT_CLIP_VALUE)
+            self.undo_squashing[res_str] = layers.UndoSquashing()
 
             # learnt_scale: (num_organisms, num_tracks)
             self.residual_scales[res_str] = nn.Parameter(torch.ones(num_organisms, num_tracks))
@@ -312,21 +317,22 @@ class GenomeTracksHead(nn.Module):
         scale = self.residual_scales[res_str][organism_index]
 
         # Softplus: softplus(x) * softplus(scale)
-        x = self.prediction_softplus[res_str](x) * self.scale_softplus(scale.unsqueeze(2))
+        x = self.prediction_softplus[res_str](x) * self.scale_softplus[res_str](scale.unsqueeze(2))
 
         return x
 
-    def unscale(self, x, organism_index, res_str, channels_last=True):
+    def unscale(self, x, organism_index, resolution, channels_last=True):
         """Unscales predictions to experimental data scale."""
         organism_index = self._organism_slot(organism_index)
         track_means = self.track_means[organism_index]  # (B, num_tracks)
         return predictions_scaling(
             x,
             track_means=track_means,
-            resolution=int(res_str),
+            resolution=resolution,
             apply_squashing=self.apply_squashing,
             channels_last=channels_last,
-            soft_clip_module=self.prediction_soft_clip[res_str],
+            undo_softclip_module=self.undo_softclip[str(resolution)],
+            undo_squashing_module=self.undo_squashing[str(resolution)],
         )
 
     def scale(self, x, organism_index, resolution, channels_last=True):
@@ -385,7 +391,7 @@ class GenomeTracksHead(nn.Module):
             if return_scaled:
                 outputs[res] = scaled_pred
             else:
-                outputs[res] = self.unscale(scaled_pred, organism_index, res_str, channels_last)
+                outputs[res] = self.unscale(scaled_pred, organism_index, res, channels_last)
 
         return outputs
 
@@ -599,8 +605,8 @@ class SpliceSitesJunctionHead(nn.Module):
             "neg_donor": make_rope_params(),
             "neg_acceptor": make_rope_params(),
         })
-        self.pos_splice_pair_bilinear = layers.BilinearOp("bdth,bath->bdat")
-        self.neg_splice_pair_bilinear = layers.BilinearOp("bdth,bath->bdat")
+        self.pos_junction_bilinear = layers.BilinearOp("bdth,bath->bdat")
+        self.neg_junction_bilinear = layers.BilinearOp("bdth,bath->bdat")
         self.pos_counts_softplus = nn.Softplus()
         self.neg_counts_softplus = nn.Softplus()
 
@@ -646,7 +652,7 @@ class SpliceSitesJunctionHead(nn.Module):
                 return apply_rope(
                     x, indices,
                     max_position=self._max_position_encoding_distance,
-                    inplace=False,
+                    inplace=True,
                 )
 
             pos_donor_logits = _apply_rope(
@@ -667,10 +673,10 @@ class SpliceSitesJunctionHead(nn.Module):
             )
 
             pos_counts = self.pos_counts_softplus(
-                self.pos_splice_pair_bilinear(pos_donor_logits, pos_acceptor_logits)
+                self.pos_junction_bilinear(pos_donor_logits, pos_acceptor_logits)
             )
             neg_counts = self.neg_counts_softplus(
-                self.neg_splice_pair_bilinear(neg_donor_logits, neg_acceptor_logits)
+                self.neg_junction_bilinear(neg_donor_logits, neg_acceptor_logits)
             )
 
             pos_mask = torch.einsum("bd,ba->bda", pos_donor_idx >= 0, pos_acceptor_idx >= 0)
