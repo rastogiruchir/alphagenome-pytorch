@@ -3,10 +3,7 @@ from __future__ import annotations
 from concurrent import futures
 
 import grpc
-import numpy as np
-import pandas as pd
 import pytest
-import torch
 
 from alphagenome import tensor_utils
 from alphagenome.data import genome
@@ -15,76 +12,12 @@ from alphagenome.protos import dna_model_pb2, dna_model_service_pb2, dna_model_s
 
 from alphagenome_pytorch.extensions.serving.adapter import LocalDnaModelAdapter, SEQUENCE_LENGTH_16KB
 from alphagenome_pytorch.extensions.serving.grpc_service import LocalDnaModelService
-from alphagenome_pytorch.variant_scoring.types import (
-    Interval as PTInterval,
-    OutputType as PTOutputType,
-    TrackMetadata as PTTrackMetadata,
-    Variant as PTVariant,
-    VariantScore,
-)
+from alphagenome_pytorch.extensions.serving.scorer import VariantScorer
+
+from .serving_fakes import FakeAnndataModule, FakeRuntime, FakeScoringModel
 
 
-class _FakeAnndataModule:
-    class AnnData:
-        def __init__(self, X, obs=None, var=None, uns=None, layers=None):
-            self.X = X
-            self.obs = obs if obs is not None else pd.DataFrame()
-            self.var = var if var is not None else pd.DataFrame()
-            self.uns = uns if uns is not None else {}
-            self.layers = layers if layers is not None else {}
-
-
-class _FakeScoringModel:
-    def __init__(self):
-        self._metadata = {
-            0: {
-                PTOutputType.DNASE: [
-                    PTTrackMetadata(0, 'track_a', '.', PTOutputType.DNASE, ontology_curie='CL:0001'),
-                    PTTrackMetadata(1, 'track_b', '.', PTOutputType.DNASE, ontology_curie='CL:0002'),
-                ]
-            }
-        }
-
-    def get_track_metadata(self, organism=None):
-        del organism
-        return self._metadata[0]
-
-    def predict(self, sequence, organism=None, **kwargs):
-        del organism, kwargs
-        seq_len = len(sequence)
-        values = np.ones((1, seq_len, 2), dtype=np.float32)
-        return {'dnase': {1: values}}
-
-    def get_sequence(self, interval, variant=None):
-        del variant
-        return 'A' * interval.width
-
-    def predict_variant(self, interval, variant, organism=None):
-        del variant, organism
-        ref = self.predict('A' * interval.width)
-        alt = self.predict('A' * interval.width)
-        alt['dnase'][1] = alt['dnase'][1] + 1.0
-        return ref, alt
-
-    def score_variant(self, interval, variant, scorers, organism=None):
-        del interval, variant, organism
-        result = []
-        for scorer in scorers:
-            result.append(
-                VariantScore(
-                    variant=PTVariant('chr1', 10, 'A', 'C'),
-                    interval=PTInterval('chr1', 0, SEQUENCE_LENGTH_16KB),
-                    scorer=scorer,
-                    scores=torch.tensor([1.0, 2.0]),
-                )
-            )
-        return result
-
-
-@pytest.fixture
-def grpc_server(monkeypatch):
-    monkeypatch.setitem(__import__('sys').modules, 'anndata', _FakeAnndataModule)
-    adapter = LocalDnaModelAdapter(_FakeScoringModel())
+def _start_grpc(adapter):
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     dna_model_service_pb2_grpc.add_DnaModelServiceServicer_to_server(
         LocalDnaModelService(adapter),
@@ -99,6 +32,82 @@ def grpc_server(monkeypatch):
     finally:
         channel.close()
         server.stop(grace=0.0)
+
+
+@pytest.fixture
+def grpc_server(monkeypatch):
+    monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
+    runtime = FakeRuntime()
+    adapter = LocalDnaModelAdapter(
+        runtime, scorer=VariantScorer(runtime, FakeScoringModel()),
+    )
+    yield from _start_grpc(adapter)
+
+
+@pytest.fixture
+def catalog_grpc_server(monkeypatch):
+    """A router-backed (catalog-mode) service with one entry, ``'m1'``.
+
+    The two catalog error paths (missing / unknown ``alphagenome-model-id``)
+    reject before any model computation, so the entry's adapter is never built
+    — a bare ``nn.Linear`` base and a lambda adapter factory are enough.
+    """
+    import torch.nn as nn
+
+    from alphagenome_pytorch.extensions.serving.router import (
+        ServedModelEntry,
+        ServedModelRouter,
+    )
+
+    monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
+    entry = ServedModelEntry(
+        id='m1', label='M1', kind='adapter', base_model_hash='sha256:demo',
+    )
+    router = ServedModelRouter(
+        base_model=nn.Linear(4, 4),
+        runtime=FakeRuntime(),
+        entries=[entry],
+        adapter_factory=lambda r, e: object(),  # unreached on the error paths
+    )
+    yield from _start_grpc(router)
+
+
+def _catalog_predict_request():
+    return dna_model_service_pb2.PredictSequenceRequest(
+        sequence='A' * SEQUENCE_LENGTH_16KB,
+        organism=dna_model_pb2.ORGANISM_HOMO_SAPIENS,
+        requested_outputs=[dna_output.OutputType.DNASE.to_proto()],
+    )
+
+
+def test_catalog_missing_model_id_is_failed_precondition(catalog_grpc_server):
+    """Regression: a deliberate abort raised inside ``_acquire`` must not be
+    swallowed by the RPC method's broad ``except`` and re-aborted as INTERNAL."""
+    with pytest.raises(grpc.RpcError) as exc_info:
+        list(catalog_grpc_server.PredictSequence(iter([_catalog_predict_request()])))
+    assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    # Details must survive too — the INTERNAL bug also blanked them.
+    assert 'alphagenome-model-id' in exc_info.value.details()
+
+
+def test_catalog_unknown_model_id_is_not_found(catalog_grpc_server):
+    """Regression: unknown model id must surface NOT_FOUND, not INTERNAL."""
+    metadata = (('alphagenome-model-id', 'does-not-exist'),)
+    with pytest.raises(grpc.RpcError) as exc_info:
+        list(
+            catalog_grpc_server.PredictSequence(
+                iter([_catalog_predict_request()]), metadata=metadata
+            )
+        )
+    assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
+    assert 'does-not-exist' in exc_info.value.details()
+
+
+@pytest.fixture
+def prediction_only_grpc_server(monkeypatch):
+    monkeypatch.setitem(__import__('sys').modules, 'anndata', FakeAnndataModule)
+    adapter = LocalDnaModelAdapter(FakeRuntime())
+    yield from _start_grpc(adapter)
 
 
 def test_predict_sequence_rpc(grpc_server):
@@ -137,6 +146,17 @@ def test_score_variant_rpc(grpc_server):
     assert responses[0].output.variant_data.metadata.variant.chromosome == 'chr1'
 
 
+def test_score_variant_rpc_prediction_only_unimplemented(prediction_only_grpc_server):
+    request = dna_model_service_pb2.ScoreVariantRequest(
+        interval=genome.Interval('chr1', 0, SEQUENCE_LENGTH_16KB).to_proto(),
+        variant=genome.Variant('chr1', 10, 'A', 'C').to_proto(),
+        organism=dna_model_pb2.ORGANISM_HOMO_SAPIENS,
+    )
+    with pytest.raises(grpc.RpcError) as exc_info:
+        list(prediction_only_grpc_server.ScoreVariant(iter([request])))
+    assert exc_info.value.code() == grpc.StatusCode.UNIMPLEMENTED
+
+
 def test_metadata_rpc(grpc_server):
     request = dna_model_service_pb2.MetadataRequest(
         organism=dna_model_pb2.ORGANISM_HOMO_SAPIENS
@@ -146,3 +166,22 @@ def test_metadata_rpc(grpc_server):
     by_type = {m.output_type for m in responses[0].output_metadata}
     assert dna_output.OutputType.DNASE.to_proto() in by_type
 
+
+def test_organism_or_none_maps_unspecified_to_none():
+    """gRPC omitting organism sends ORGANISM_UNSPECIFIED (0); it must become None
+    so the runtime's embedded default (e.g. a mouse bundle) is consulted."""
+    from alphagenome.protos import dna_model_pb2
+
+    from alphagenome_pytorch.extensions.serving.grpc_service import (
+        _organism_or_none,
+    )
+
+    assert _organism_or_none(dna_model_pb2.ORGANISM_UNSPECIFIED) is None
+    assert (
+        _organism_or_none(dna_model_pb2.ORGANISM_MUS_MUSCULUS)
+        == dna_model_pb2.ORGANISM_MUS_MUSCULUS
+    )
+    assert (
+        _organism_or_none(dna_model_pb2.ORGANISM_HOMO_SAPIENS)
+        == dna_model_pb2.ORGANISM_HOMO_SAPIENS
+    )

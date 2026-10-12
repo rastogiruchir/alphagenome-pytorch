@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import json
 import logging
@@ -19,23 +20,26 @@ from alphagenome.data import junction_data as ag_junction_data
 from alphagenome.data import track_data as ag_track_data
 from alphagenome.models import dna_output
 
-from alphagenome_pytorch.variant_scoring.scorers import (
-    BaseVariantScorer as PTBaseVariantScorer,
-    CenterMaskScorer as PTCenterMaskScorer,
-    ContactMapScorer as PTContactMapScorer,
-    GeneMaskActiveScorer as PTGeneMaskActiveScorer,
-    GeneMaskLFCScorer as PTGeneMaskLFCScorer,
-    GeneMaskSplicingScorer as PTGeneMaskSplicingScorer,
-    PolyadenylationScorer as PTPolyadenylationScorer,
-    SpliceJunctionScorer as PTSpliceJunctionScorer,
-)
-from alphagenome_pytorch.variant_scoring.scorers.gene_mask import GeneMaskMode
-from alphagenome_pytorch.variant_scoring.types import (
-    AggregationType as PTAggregationType,
-    OutputType as PTOutputType,
-)
+from alphagenome_pytorch.variant_scoring.types import OutputType as PTOutputType
 
 from .adapter import LocalDnaModelAdapter, _OFFICIAL_TO_PT_OUTPUT, _normalize_output_type
+from alphagenome_pytorch.extensions.attribution import UnsupportedMethodError
+
+# NOTE: variant-scoring scorer classes (``CenterMaskScorer`` etc.) and
+# ``GeneMaskMode`` / ``AggregationType`` are deliberately *not* imported at
+# module load time. They live in ``alphagenome_pytorch.variant_scoring.scorers``
+# which is heavyweight (gene-mask, polyadenylation, splice-junction machinery).
+# The ``--checkpoint`` (fine-tuned) serving path doesn't need any of that, so
+# this module loads them on demand via :py:func:`_get_scorer_builders`.
+#
+# Caveat: ``alphagenome_pytorch.variant_scoring.__init__`` currently re-exports
+# the scorers eagerly, which means importing *any* ``variant_scoring`` submodule
+# (including ``variant_scoring.types`` below, used by the adapter) still pulls
+# the scorers into ``sys.modules`` today. Fully decoupling rest_service from
+# the scoring stack requires making that package init lazy too — out of scope
+# for this PR. The lazy import here is still worthwhile: it establishes the
+# boundary at this layer and benefits automatically once the package init is
+# refactored.
 
 LOGGER = logging.getLogger(__name__)
 
@@ -136,72 +140,95 @@ def _scorer_enum(
     raise ValueError(f'Field "{field}" must be a string naming a {enum_cls.__name__} member.')
 
 
-def _center_mask_from_json(payload: dict[str, Any]) -> PTCenterMaskScorer:
-    width = payload.get('width')
-    return PTCenterMaskScorer(
-        requested_output=_scorer_pt_output(payload),
-        width=int(width) if width is not None else None,
-        aggregation_type=_scorer_enum(payload, 'aggregation_type', PTAggregationType),
+_SCORER_BUILDERS_CACHE: dict[str, Callable[[dict[str, Any]], Any]] | None = None
+
+
+def _get_scorer_builders() -> dict[str, Callable[[dict[str, Any]], Any]]:
+    """Lazily import variant-scoring classes and return the JSON→scorer dispatch table.
+
+    Defers ``alphagenome_pytorch.variant_scoring.scorers`` (and the
+    gene-mask / polyadenylation / splice-junction sub-modules it transitively
+    pulls in) until a scoring request actually arrives. The fine-tuned
+    serving path (``--checkpoint``) never enters this code, so its process
+    avoids loading the scoring stack entirely.
+    """
+    global _SCORER_BUILDERS_CACHE
+    if _SCORER_BUILDERS_CACHE is not None:
+        return _SCORER_BUILDERS_CACHE
+
+    from alphagenome_pytorch.variant_scoring.scorers import (
+        CenterMaskScorer as PTCenterMaskScorer,
+        ContactMapScorer as PTContactMapScorer,
+        GeneMaskActiveScorer as PTGeneMaskActiveScorer,
+        GeneMaskLFCScorer as PTGeneMaskLFCScorer,
+        GeneMaskSplicingScorer as PTGeneMaskSplicingScorer,
+        PolyadenylationScorer as PTPolyadenylationScorer,
+        SpliceJunctionScorer as PTSpliceJunctionScorer,
     )
+    from alphagenome_pytorch.variant_scoring.scorers.gene_mask import GeneMaskMode
+    from alphagenome_pytorch.variant_scoring.types import AggregationType as PTAggregationType
+
+    def _center_mask_from_json(payload: dict[str, Any]):
+        width = payload.get('width')
+        return PTCenterMaskScorer(
+            requested_output=_scorer_pt_output(payload),
+            width=int(width) if width is not None else None,
+            aggregation_type=_scorer_enum(payload, 'aggregation_type', PTAggregationType),
+        )
+
+    def _contact_map_from_json(payload: dict[str, Any]):
+        del payload
+        return PTContactMapScorer()
+
+    def _gene_mask_lfc_from_json(payload: dict[str, Any]):
+        return PTGeneMaskLFCScorer(
+            requested_output=_scorer_pt_output(payload),
+            mask_mode=_scorer_enum(payload, 'mask_mode', GeneMaskMode, default=GeneMaskMode.EXONS),
+        )
+
+    def _gene_mask_active_from_json(payload: dict[str, Any]):
+        return PTGeneMaskActiveScorer(
+            requested_output=_scorer_pt_output(payload),
+            mask_mode=_scorer_enum(payload, 'mask_mode', GeneMaskMode, default=GeneMaskMode.EXONS),
+        )
+
+    def _gene_mask_splicing_from_json(payload: dict[str, Any]):
+        width = payload.get('width')
+        return PTGeneMaskSplicingScorer(
+            requested_output=_scorer_pt_output(payload),
+            width=int(width) if width is not None else None,
+        )
+
+    def _polyadenylation_from_json(payload: dict[str, Any]):
+        return PTPolyadenylationScorer(
+            min_pas_count=int(payload.get('min_pas_count', 2)),
+            min_pas_coverage=float(payload.get('min_pas_coverage', 0.8)),
+        )
+
+    def _splice_junction_from_json(payload: dict[str, Any]):
+        return PTSpliceJunctionScorer(
+            filter_protein_coding=bool(payload.get('filter_protein_coding', True)),
+        )
+
+    _SCORER_BUILDERS_CACHE = {
+        'center_mask': _center_mask_from_json,
+        'contact_map': _contact_map_from_json,
+        'gene_mask_lfc': _gene_mask_lfc_from_json,
+        'gene_mask_active': _gene_mask_active_from_json,
+        'gene_mask_splicing': _gene_mask_splicing_from_json,
+        'polyadenylation': _polyadenylation_from_json,
+        'splice_junction': _splice_junction_from_json,
+    }
+    return _SCORER_BUILDERS_CACHE
 
 
-def _contact_map_from_json(payload: dict[str, Any]) -> PTContactMapScorer:
-    del payload
-    return PTContactMapScorer()
-
-
-def _gene_mask_lfc_from_json(payload: dict[str, Any]) -> PTGeneMaskLFCScorer:
-    return PTGeneMaskLFCScorer(
-        requested_output=_scorer_pt_output(payload),
-        mask_mode=_scorer_enum(payload, 'mask_mode', GeneMaskMode, default=GeneMaskMode.EXONS),
-    )
-
-
-def _gene_mask_active_from_json(payload: dict[str, Any]) -> PTGeneMaskActiveScorer:
-    return PTGeneMaskActiveScorer(
-        requested_output=_scorer_pt_output(payload),
-        mask_mode=_scorer_enum(payload, 'mask_mode', GeneMaskMode, default=GeneMaskMode.EXONS),
-    )
-
-
-def _gene_mask_splicing_from_json(payload: dict[str, Any]) -> PTGeneMaskSplicingScorer:
-    width = payload.get('width')
-    return PTGeneMaskSplicingScorer(
-        requested_output=_scorer_pt_output(payload),
-        width=int(width) if width is not None else None,
-    )
-
-
-def _polyadenylation_from_json(payload: dict[str, Any]) -> PTPolyadenylationScorer:
-    return PTPolyadenylationScorer(
-        min_pas_count=int(payload.get('min_pas_count', 2)),
-        min_pas_coverage=float(payload.get('min_pas_coverage', 0.8)),
-    )
-
-
-def _splice_junction_from_json(payload: dict[str, Any]) -> PTSpliceJunctionScorer:
-    return PTSpliceJunctionScorer(
-        filter_protein_coding=bool(payload.get('filter_protein_coding', True)),
-    )
-
-
-_SCORER_BUILDERS: dict[str, Callable[[dict[str, Any]], PTBaseVariantScorer]] = {
-    'center_mask': _center_mask_from_json,
-    'contact_map': _contact_map_from_json,
-    'gene_mask_lfc': _gene_mask_lfc_from_json,
-    'gene_mask_active': _gene_mask_active_from_json,
-    'gene_mask_splicing': _gene_mask_splicing_from_json,
-    'polyadenylation': _polyadenylation_from_json,
-    'splice_junction': _splice_junction_from_json,
-}
-
-
-def _parse_variant_scorers(raw: Any) -> list[PTBaseVariantScorer]:
+def _parse_variant_scorers(raw: Any) -> list[Any]:
     if raw is None:
         return []
     if not isinstance(raw, list):
         raise ValueError('"variant_scorers" must be a JSON list of scorer objects.')
-    scorers: list[PTBaseVariantScorer] = []
+    builders = _get_scorer_builders()
+    scorers: list[Any] = []
     for index, item in enumerate(raw):
         if not isinstance(item, dict):
             raise ValueError(
@@ -211,13 +238,13 @@ def _parse_variant_scorers(raw: Any) -> list[PTBaseVariantScorer]:
         if not isinstance(scorer_type, str):
             raise ValueError(
                 f'variant_scorers[{index}] missing required string field "type". '
-                f'Supported types: {", ".join(sorted(_SCORER_BUILDERS))}.'
+                f'Supported types: {", ".join(sorted(builders))}.'
             )
-        builder = _SCORER_BUILDERS.get(scorer_type)
+        builder = builders.get(scorer_type)
         if builder is None:
             raise ValueError(
                 f'Unknown variant scorer type "{scorer_type}" at variant_scorers[{index}]. '
-                f'Supported: {", ".join(sorted(_SCORER_BUILDERS))}.'
+                f'Supported: {", ".join(sorted(builders))}.'
             )
         scorers.append(builder(item))
     return scorers
@@ -323,8 +350,54 @@ def _serialize_output_metadata(metadata: dna_output.OutputMetadata) -> dict[str,
     }
 
 
+def _nan_to_none(arr: np.ndarray) -> list:
+    """Convert a numpy array to a nested list with NaN replaced by None.
+
+    ``ndarray.tolist()`` maps NaN to ``float('nan')``, which ``json.dumps``
+    serializes as the non-standard ``NaN`` token.  We want ``null`` instead,
+    so we replace NaN values with ``None`` in a Python object array first.
+    """
+    if not np.issubdtype(arr.dtype, np.floating):
+        return arr.tolist()
+    mask = np.isnan(arr)
+    if not mask.any():
+        return arr.tolist()
+    obj = arr.astype(object)
+    obj[mask] = None
+    return obj.tolist()
+
+
+def _serialize_attribution(result: 'AttributionResult') -> dict[str, Any]:
+    """Convert an :class:`AttributionResult` to a JSON-serializable dict.
+
+    NaN values in the numpy arrays are mapped to ``null`` via
+    :func:`_nan_to_none`.
+    """
+    payload: dict[str, Any] = {
+        'method': result.method,
+        'kind': result.kind,
+        'bases': list(result.bases),
+        'values': _nan_to_none(result.values),
+        'sequence': result.sequence,
+        'target_start': result.target_start,
+        'target_end': result.target_end,
+        'resolution': result.resolution,
+        'track_indices': list(result.track_indices),
+        'reduction': result.reduction,
+        'metadata': result.metadata,
+    }
+    if result.raw_gradient is not None:
+        payload['raw_gradient'] = _nan_to_none(result.raw_gradient)
+    else:
+        payload['raw_gradient'] = None
+    return payload
+
+
 class _ServingHandler(BaseHTTPRequestHandler):
-    adapter: LocalDnaModelAdapter
+    # Either ``adapter`` (singleton mode) or ``router`` (catalog mode) is set
+    # on the subclass produced by ``_make_handler``.
+    adapter: LocalDnaModelAdapter | None = None
+    router: Any | None = None
 
     def _read_json(self) -> dict[str, Any]:
         content_length = int(self.headers.get('Content-Length', '0'))
@@ -341,105 +414,225 @@ class _ServingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    @contextlib.contextmanager
+    def _acquire_adapter(
+        self,
+        body: dict[str, Any] | None = None,
+        scoped_model_id: str | None = None,
+    ):
+        """Yield the per-request adapter, holding the router lock in catalog mode.
+
+        The lock is held for the whole ``with`` body so the shared base model
+        cannot be re-swapped by a concurrent request while this one runs its
+        model call. Singleton mode needs no lock. Raises on ambiguity / unknown
+        id / URL-vs-body mismatch (surfaced by ``_write_router_error``).
+        """
+        if self.router is None:
+            yield self.adapter  # singleton mode
+            return
+        body_id = (body or {}).get('model_id')
+        if scoped_model_id and body_id and scoped_model_id != body_id:
+            raise ValueError(
+                f"model_id mismatch: URL={scoped_model_id!r} body={body_id!r}"
+            )
+        requested = scoped_model_id or body_id
+        resolved = self.router.resolve_model_id(requested)
+        with self.router.acquire(resolved) as adapter:
+            yield adapter
+
+    def _scoped_model_id(self, path: str) -> tuple[str | None, str]:
+        """Parse the request path into ``(model_id, route_suffix)``.
+
+        - ``/v1/predict_sequence`` → ``(None, '/predict_sequence')``
+        - ``/v1/models/foo/predict_sequence`` → ``('foo', '/predict_sequence')``
+        - ``/v1/models/foo`` → ``('foo', '')``
+        - any path not starting with ``/v1`` → ``(None, path)``
+        """
+        scoped_prefix = '/v1/models/'
+        v1_prefix = '/v1'
+        if path.startswith(scoped_prefix):
+            tail = path[len(scoped_prefix):]
+            if '/' not in tail:
+                return tail, ''
+            mid, _, rest = tail.partition('/')
+            return mid, '/' + rest
+        if path.startswith(v1_prefix):
+            return None, path[len(v1_prefix):]
+        return None, path
+
     def do_GET(self) -> None:  # noqa: N802
         try:
-            if self.path.startswith('/v1/output_metadata'):
+            path = self.path.split('?', 1)[0]
+
+            if path == '/v1/models':
+                if self.router is None:
+                    # Singleton mode: surface the implicit single model.
+                    self._write_json({'models': [{
+                        'id': 'default', 'kind': 'singleton', 'label': None,
+                    }]})
+                else:
+                    self._write_json({'models': self.router.list_models()})
+                return
+
+            scoped_id, rest = self._scoped_model_id(path)
+            if scoped_id is not None and rest == '/metadata':
                 organism = self._parse_query_value('organism')
-                metadata = self.adapter.output_metadata(organism=organism)
+                with self._acquire_adapter(scoped_model_id=scoped_id) as adapter:
+                    metadata = adapter.output_metadata(organism=organism)
+                self._write_json({'metadata': _serialize_output_metadata(metadata)})
+                return
+
+            if path.startswith('/v1/output_metadata'):
+                organism = self._parse_query_value('organism')
+                with self._acquire_adapter() as adapter:
+                    metadata = adapter.output_metadata(organism=organism)
                 self._write_json({'metadata': _serialize_output_metadata(metadata)})
                 return
             self._write_json({'error': 'Not found'}, status=HTTPStatus.NOT_FOUND)
-        except Exception as exc:  # pragma: no cover - exercised in integration.
-            self._write_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
+        except Exception as exc:
+            self._write_router_error(exc)
 
     def do_POST(self) -> None:  # noqa: N802
         try:
             body = self._read_json()
             path = self.path.split('?', 1)[0]
 
-            if path == '/v1/predict_sequence':
-                output = self.adapter.predict_sequence(
-                    sequence=body['sequence'],
-                    organism=body.get('organism', 'HOMO_SAPIENS'),
-                    requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
-                    ontology_terms=body.get('ontology_terms'),
-                )
-                self._write_json({'output': _serialize_output(output)})
-                return
+            scoped_id, route = self._scoped_model_id(path)
+            # Hold the router lock only across resolve + adapter swap + the model
+            # call. `_run_post_route` returns a builder that serializes the
+            # (already-materialized) result; it is invoked *after* the lock is
+            # released so a slow client cannot hold the single catalog slot
+            # through serialization/socket write.
+            with self._acquire_adapter(body=body, scoped_model_id=scoped_id) as adapter:
+                build_payload, status = self._run_post_route(adapter, route, body)
+            self._write_json(build_payload(), status=status)
+        except NotImplementedError as exc:
+            self._write_json({'error': str(exc)}, status=HTTPStatus.NOT_IMPLEMENTED)
+        except Exception as exc:
+            self._write_router_error(exc)
 
-            if path == '/v1/predict_interval':
-                output = self.adapter.predict_interval(
+    def _run_post_route(
+        self, adapter: LocalDnaModelAdapter, route: str, body: dict[str, Any]
+    ) -> tuple[Callable[[], dict[str, Any]], int]:
+        """Run the model call for ``route`` and return ``(build_payload, status)``.
+
+        Runs under the caller's router lock, so only the model computation (and
+        cheap request parsing) happens here. ``build_payload()`` serializes the
+        already-materialized result and MUST be called *after* the lock is
+        released — tensor/AnnData serialization, JSON encoding, and the socket
+        write never hold the catalog slot. Unknown routes yield a 404 builder.
+        """
+        if route == '/predict_sequence':
+            output = adapter.predict_sequence(
+                sequence=body['sequence'],
+                organism=body.get('organism'),
+                requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
+                ontology_terms=body.get('ontology_terms'),
+            )
+            return lambda: {'output': _serialize_output(output)}, HTTPStatus.OK
+
+        if route == '/predict_interval':
+            output = adapter.predict_interval(
+                interval=_interval_from_payload(body['interval']),
+                organism=body.get('organism'),
+                requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
+                ontology_terms=body.get('ontology_terms'),
+            )
+            return lambda: {'output': _serialize_output(output)}, HTTPStatus.OK
+
+        if route == '/predict_variant':
+            output = adapter.predict_variant(
+                interval=_interval_from_payload(body['interval']),
+                variant=_variant_from_payload(body['variant']),
+                organism=body.get('organism'),
+                requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
+                ontology_terms=body.get('ontology_terms'),
+            )
+            return lambda: {'output': _serialize_variant_output(output)}, HTTPStatus.OK
+
+        if route == '/score_variant':
+            scores = adapter.score_variant(
+                interval=_interval_from_payload(body['interval']),
+                variant=_variant_from_payload(body['variant']),
+                variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
+                organism=body.get('organism'),
+            )
+            return lambda: {'scores': [_serialize_anndata(s) for s in scores]}, HTTPStatus.OK
+
+        if route == '/score_variants':
+            intervals_payload = body['intervals']
+            variants_payload = body['variants']
+            if isinstance(intervals_payload, dict):
+                intervals: genome.Interval | list[genome.Interval] = _interval_from_payload(intervals_payload)
+            else:
+                intervals = [_interval_from_payload(i) for i in intervals_payload]
+            variants = [_variant_from_payload(v) for v in variants_payload]
+            scores = adapter.score_variants(
+                intervals=intervals,
+                variants=variants,
+                variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
+                organism=body.get('organism'),
+                progress_bar=False,
+                max_workers=int(body.get('max_workers', 5)),
+            )
+            return (
+                lambda: {'scores': [[_serialize_anndata(s) for s in group] for group in scores]},
+                HTTPStatus.OK,
+            )
+
+        if route == '/score_ism_variants':
+            interval_variant_payload = body.get('interval_variant')
+            scores = adapter.score_ism_variants(
+                interval=_interval_from_payload(body['interval']),
+                ism_interval=_interval_from_payload(body['ism_interval']),
+                variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
+                organism=body.get('organism'),
+                interval_variant=_variant_from_payload(interval_variant_payload)
+                if interval_variant_payload
+                else None,
+                progress_bar=False,
+                max_workers=int(body.get('max_workers', 5)),
+            )
+            return (
+                lambda: {'scores': [[_serialize_anndata(s) for s in group] for group in scores]},
+                HTTPStatus.OK,
+            )
+
+        if route == '/explain_interval':
+            try:
+                result = adapter.explain_interval(
                     interval=_interval_from_payload(body['interval']),
-                    organism=body.get('organism', 'HOMO_SAPIENS'),
-                    requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
-                    ontology_terms=body.get('ontology_terms'),
+                    target_interval=_interval_from_payload(body['target_interval']),
+                    organism=body.get('organism'),
+                    requested_output=body['requested_output'],
+                    resolution=int(body.get('resolution', 128)),
+                    track_indices=[int(i) for i in body['track_indices']],
+                    method=body['method'],
+                    reduction=body.get('reduction', 'sum'),
+                    include_raw_gradient=bool(body.get('include_raw_gradient', False)),
+                    strand_averaged=bool(body.get('strand_averaged', False)),
+                    batch_size=int(body.get('batch_size', 8)),
                 )
-                self._write_json({'output': _serialize_output(output)})
-                return
+            except UnsupportedMethodError as exc:
+                msg = str(exc)
+                return lambda: {'error': msg}, HTTPStatus.BAD_REQUEST
+            return lambda: {'attribution': _serialize_attribution(result)}, HTTPStatus.OK
 
-            if path == '/v1/predict_variant':
-                output = self.adapter.predict_variant(
-                    interval=_interval_from_payload(body['interval']),
-                    variant=_variant_from_payload(body['variant']),
-                    organism=body.get('organism', 'HOMO_SAPIENS'),
-                    requested_outputs=[_normalize_output_type(v) for v in body.get('requested_outputs', [])],
-                    ontology_terms=body.get('ontology_terms'),
-                )
-                self._write_json({'output': _serialize_variant_output(output)})
-                return
+        return lambda: {'error': 'Not found'}, HTTPStatus.NOT_FOUND
 
-            if path == '/v1/score_variant':
-                scores = self.adapter.score_variant(
-                    interval=_interval_from_payload(body['interval']),
-                    variant=_variant_from_payload(body['variant']),
-                    variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
-                    organism=body.get('organism', 'HOMO_SAPIENS'),
-                )
-                self._write_json({'scores': [_serialize_anndata(s) for s in scores]})
-                return
-
-            if path == '/v1/score_variants':
-                intervals_payload = body['intervals']
-                variants_payload = body['variants']
-                if isinstance(intervals_payload, dict):
-                    intervals: genome.Interval | list[genome.Interval] = _interval_from_payload(intervals_payload)
-                else:
-                    intervals = [_interval_from_payload(i) for i in intervals_payload]
-                variants = [_variant_from_payload(v) for v in variants_payload]
-                scores = self.adapter.score_variants(
-                    intervals=intervals,
-                    variants=variants,
-                    variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
-                    organism=body.get('organism', 'HOMO_SAPIENS'),
-                    progress_bar=False,
-                    max_workers=int(body.get('max_workers', 5)),
-                )
-                self._write_json(
-                    {'scores': [[_serialize_anndata(s) for s in group] for group in scores]}
-                )
-                return
-
-            if path == '/v1/score_ism_variants':
-                interval_variant_payload = body.get('interval_variant')
-                scores = self.adapter.score_ism_variants(
-                    interval=_interval_from_payload(body['interval']),
-                    ism_interval=_interval_from_payload(body['ism_interval']),
-                    variant_scorers=_parse_variant_scorers(body.get('variant_scorers')),
-                    organism=body.get('organism', 'HOMO_SAPIENS'),
-                    interval_variant=_variant_from_payload(interval_variant_payload)
-                    if interval_variant_payload
-                    else None,
-                    progress_bar=False,
-                    max_workers=int(body.get('max_workers', 5)),
-                )
-                self._write_json(
-                    {'scores': [[_serialize_anndata(s) for s in group] for group in scores]}
-                )
-                return
-
-            self._write_json({'error': 'Not found'}, status=HTTPStatus.NOT_FOUND)
-        except Exception as exc:  # pragma: no cover - exercised in integration.
+    def _write_router_error(self, exc: Exception) -> None:
+        from alphagenome_pytorch.extensions.serving.router import (
+            AmbiguousModelError,
+            ModelNotFoundError,
+        )
+        if isinstance(exc, AmbiguousModelError):
             self._write_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if isinstance(exc, ModelNotFoundError):
+            self._write_json({'error': f'Unknown model_id: {exc.args[0]!r}'},
+                             status=HTTPStatus.NOT_FOUND)
+            return
+        self._write_json({'error': str(exc)}, status=HTTPStatus.BAD_REQUEST)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         LOGGER.info('REST %s - %s', self.address_string(), format % args)
@@ -455,23 +648,32 @@ class _ServingHandler(BaseHTTPRequestHandler):
         return None
 
 
-def _make_handler(adapter: LocalDnaModelAdapter):
+def _make_handler(target: Any):
+    """Build a handler subclass bound to either a singleton adapter or a router."""
+    from alphagenome_pytorch.extensions.serving.router import ServedModelRouter
+
     class Handler(_ServingHandler):
         pass
 
-    Handler.adapter = adapter
+    if isinstance(target, ServedModelRouter):
+        Handler.router = target
+        Handler.adapter = None
+    else:
+        Handler.router = None
+        Handler.adapter = target
     return Handler
 
 
 def serve_rest(
-    adapter: LocalDnaModelAdapter,
+    target: Any,
     *,
     host: str = '127.0.0.1',
     port: int = 8080,
     wait: bool = True,
 ) -> ThreadingHTTPServer:
-    """Start a local REST server with JSON endpoints."""
-    server = ThreadingHTTPServer((host, port), _make_handler(adapter))
+    """Start a local REST server. ``target`` may be a :class:`LocalDnaModelAdapter`
+    (singleton) or a :class:`ServedModelRouter` (catalog mode)."""
+    server = ThreadingHTTPServer((host, port), _make_handler(target))
     bound_host, bound_port = server.server_address
     LOGGER.info('Local REST serving started at http://%s:%d', bound_host, bound_port)
 
