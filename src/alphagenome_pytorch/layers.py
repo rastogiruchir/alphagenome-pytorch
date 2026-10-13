@@ -132,8 +132,16 @@ class LayerNorm(nn.Module):
 
     Matches JAX: alphagenome_research.model.layers.LayerNorm
     JAX computes variance in float32 for numerical stability, then casts back.
+    Here, we compute the entire normalization in float32 to use standard
+    DeepLIFT rules, then cast back to the input dtype before applying weight
+    and bias.
     """
-    def __init__(self, normalized_shape, eps: float = 1e-5, elementwise_affine: bool = True, rms_norm: bool = False):
+    def __init__(
+        self,
+        normalized_shape, eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        rms_norm: bool = False
+    ):
         super().__init__()
         if isinstance(normalized_shape, int):
             normalized_shape = (normalized_shape,)
@@ -141,6 +149,15 @@ class LayerNorm(nn.Module):
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         self.rms_norm = rms_norm
+
+        if self.rms_norm:
+            # RMSNorm: x / sqrt(mean(x^2) + eps)
+            self.norm = nn.RMSNorm(self.normalized_shape, eps=self.eps, elementwise_affine=False)
+        else:
+            # Standard LayerNorm with centering
+            self.norm = nn.LayerNorm(
+                self.normalized_shape, eps=self.eps, elementwise_affine=False, bias=False
+            )
 
         if self.elementwise_affine:
             self.weight = nn.Parameter(torch.ones(self.normalized_shape))
@@ -151,22 +168,7 @@ class LayerNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
-        dims = tuple(range(x.ndim - len(self.normalized_shape), x.ndim))
-
-        if self.rms_norm:
-            # RMSNorm: x / sqrt(mean(x^2) + eps)
-            # JAX computes variance in float32 for stability
-            variance = torch.mean(x.float() ** 2, dim=dims, keepdim=True)
-            inv = torch.rsqrt(variance + self.eps).to(input_dtype)
-            x_norm = x * inv
-        else:
-            # Standard LayerNorm with centering
-            # JAX: mean and variance both computed in float32
-            mean = torch.mean(x.float(), dim=dims, keepdim=True)
-            x_centered = x - mean.to(input_dtype)
-            variance = torch.mean(x_centered.float() ** 2, dim=dims, keepdim=True)
-            inv = torch.rsqrt(variance + self.eps).to(input_dtype)
-            x_norm = x_centered * inv
+        x_norm = self.norm(x.float()).to(input_dtype)
 
         if self.elementwise_affine:
             return x_norm * self.weight + self.bias
