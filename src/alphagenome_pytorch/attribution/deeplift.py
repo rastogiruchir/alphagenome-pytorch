@@ -1,61 +1,6 @@
 import math
 
-import numpy as np
 import torch
-
-
-def local_dinucleotide_shuffle(
-    X: torch.Tensor,
-    n: int = 20,
-    bin_size: int = 1024,
-    min_bin_size: int = 512,
-    random_state: int | None = None,
-    verbose: bool = False,
-) -> torch.Tensor:
-    """Dinucleotide-shuffle sequences independently within local bins.
-
-    This function largely has the same interface as
-    :func:`tangermeme.ersatz.dinucleotide_shuffle`, but each bin is shuffled
-    independently and then stitched back into the full sequence.
-    """
-    from tangermeme.ersatz import dinucleotide_shuffle
-
-    if X.ndim != 3 or X.shape[1] != 4:
-        raise ValueError("Expected input shape (batch_size, 4, seq_length)")
-    if bin_size >= X.shape[-1]:
-        raise ValueError(
-            "Sequence length must be longer than bin_size. "
-            "Use dinucleotide_shuffle directly for shorter sequences."
-        )
-    if min_bin_size > bin_size:
-        raise ValueError("min_bin_size must be <= bin_size")
-
-    rng = np.random.RandomState(random_state)
-
-    X_shuf = X.unsqueeze(1).repeat(1, n, 1, 1)
-    for i in range(X.shape[0]):
-        for j in range(n):
-            first_cut = rng.randint(min_bin_size, bin_size + 1)
-            boundaries = [0, first_cut]
-            boundaries.extend(range(first_cut + bin_size, X.shape[-1], bin_size))
-            boundaries.append(X.shape[-1])
-
-            bins = list(zip(boundaries[:-1], boundaries[1:]))
-            if bins[-1][1] - bins[-1][0] < min_bin_size:
-                # merge last two bins if the final bin is too small
-                bins[-2] = (bins[-2][0], bins[-1][1])
-                bins.pop()
-
-            for (bin_start, bin_end) in bins:
-                shuffled = dinucleotide_shuffle(
-                    X[i:i+1, :, bin_start:bin_end],
-                    n=1,
-                    random_state=rng.randint(0, 2**31 - 1),
-                    verbose=verbose,
-                )
-                X_shuf[i, j, :, bin_start:bin_end] = shuffled[0, 0]
-
-    return X_shuf
 
 
 def softmax_symmetric_product_rule(module, grad_input, grad_output):
@@ -482,40 +427,3 @@ def layernorm_log_ratio_product_rule(module, grad_input, grad_output):
         gin_ref = gin_ref.to(dtype=grad_input[0].dtype)
 
     return (torch.cat([gin, gin_ref], dim=0),)
-
-
-def bilinear_symmetric_product_rule(module, grad_input, grad_output):
-    """DeepLIFT symmetric product rule for bilinear operations."""
-    left, left_ref = module.left.chunk(2)
-    right, right_ref = module.right.chunk(2)
-    gout, gout_ref = grad_output[0].chunk(2)
-
-    left_mid = (0.5 * (left + left_ref)).detach().requires_grad_(True)
-    right_mid = (0.5 * (right + right_ref)).detach().requires_grad_(True)
-
-    with torch.enable_grad():
-        if module.equation is None:
-            out = torch.matmul(left_mid, right_mid)
-        else:
-            out = torch.einsum(module.equation, left_mid, right_mid)
-
-        gin_left, gin_right = torch.autograd.grad(
-            out,
-            (left_mid, right_mid),
-            grad_outputs=gout,
-            retain_graph=True,
-            create_graph=False,
-        )
-
-        gin_left_ref, gin_right_ref = torch.autograd.grad(
-            out,
-            (left_mid, right_mid),
-            grad_outputs=gout_ref,
-            retain_graph=False,
-            create_graph=False,
-        )
-
-    return (
-        torch.cat([gin_left, gin_left_ref], dim=0),
-        torch.cat([gin_right, gin_right_ref], dim=0),
-    )

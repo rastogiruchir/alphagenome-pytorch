@@ -31,25 +31,24 @@ class UndoSquashing(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.pow(x, 1.0 / 0.75)
 
+# Similar to tangermeme.deep_lift_shap.BilinearOp; defined locally to avoid
+# making tangermeme a required dependency.
 class BilinearOp(nn.Module):
-    """Hookable binary bilinear contraction.
+    """Bilinear contraction of two tensors.
 
-    If ``equation`` is None, this module computes ``torch.matmul(left, right)``.
-    Otherwise it computes ``torch.einsum(equation, left, right)``. The operands
-    are used exactly as passed; any transpose, reshape, cast, or scaling should
-    happen outside this module so attribution rules stay simple.
+    Args:
+        equation:
+            If None, computes ``torch.matmul(left, right)``.
+            If a string, uses it as the equation in ``torch.einsum(equation, left, right)``.
+
+    The operands are used exactly as passed; any transpose, reshape, cast,
+    or scaling should happen outside this module.
     """
     def __init__(self, equation: str | None = None):
         super().__init__()
         self.equation = equation
 
     def forward(self, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
-        # Tangermeme temporarily adds _NON_LINEAR_OPS to every module while its
-        # DeepLIFT hooks are active; only cache these large tensors in that mode.
-        if hasattr(self, "_NON_LINEAR_OPS"):
-            self.left = left.detach()
-            self.right = right.detach()
-
         if self.equation is None:
             return torch.matmul(left, right)
         return torch.einsum(self.equation, left, right)
